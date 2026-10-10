@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI City OS</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="scene"></div>
+  <aside id="dashboard"></aside>
+  <div id="boot">Starting AI City OS…</div>
+
+  <script type="module">
+    const boot = document.getElementById('boot');
+    try {
+      const THREE = await import('three');
+      const { createCity, createCameraRig, BUILDINGS } = await import('./city.js');
+      const { createAndroid } = await import('./androids.js');
+      const { NavGrid, Walker, applySeparation, workSpot, hqSpot } = await import('./movement.js');
+      const { AgentEngine, CONFIG } = await import('./agents.js');
+      const { TaskVisuals } = await import('./tasks.js');
+      const { Dashboard } = await import('./dashboard.js');
+      const { SelectionController } = await import('./controls.js');
+
+      // ---------- Renderer ----------
+      const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 0.55;
+      document.getElementById('scene').appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 1200);
+
+      // ---------- World ----------
+      const city = createCity(scene, renderer);
+      const camRig = createCameraRig(camera, renderer.domElement);
+      const nav = new NavGrid();
+      const engine = new AgentEngine(BUILDINGS);
+      const bots = new Map();
+      const visuals = new TaskVisuals(engine, city, camera, bots);
+      const hq = BUILDINGS.find((b) => b.id === 'hq');
+      engine.checkAI();
+
+      // ---------- Player controls ----------
+      let paused = false;
+      let speed = 1;
+      let dashboard = null;
+      let selection = null;
+
+      const actions = {
+        togglePause() { paused = !paused; return paused; },
+        setSpeed(v) { speed = v; },
+        setAuto(v) { engine.autoGenerate = v; },
+        setCameraMode(m) {
+          if (m === 'cinematic') camRig.stopFollow();
+          camRig.setMode(m);
+        },
+        follow(id) {
+          const bot = bots.get(id);
+          if (!bot) return;
+          if (camRig.isFollowing(bot.rig.group)) camRig.stopFollow();
+          else camRig.follow(bot.rig.group);
+        },
+        isFollowing(id) {
+          const bot = bots.get(id);
+          return !!bot && camRig.isFollowing(bot.rig.group);
+        },
+        focusBuilding(id) {
+          const b = BUILDINGS.find((x) => x.id === id);
+          if (b) camRig.focus(b.x, b.z, 70);
+        },
+        sendBot(id, target) {
+          const bot = bots.get(id);
+          if (!bot || bot.agent.task) return false;
+          const b = target === 'hq' ? null : BUILDINGS.find((x) => x.id === target);
+          const s = b ? workSpot(b) : hqSpot();
+          bot.returnTimer = null;
+          bot.walker.goTo(s.x, s.z, b ? () => bot.walker.lookAt(b.x, b.z) : null);
+          engine.log(bot.agent.name + ' sent to ' + (b ? b.name : 'HQ'), CONFIG.departments[bot.agent.dept].color);
+          return true;
+        },
+        moveBot(id, x, z) {
+          const bot = bots.get(id);
+          if (!bot || bot.agent.task) return false;
+          bot.returnTimer = null;
+          bot.walker.goTo(x, z);
+          return true;
+        },
+        clearSelection() { selection.select(null); }
+      };
+
+      dashboard = new Dashboard(document.getElementById('dashboard'), engine, actions);
+      selection = new SelectionController({
+        camera,
+        dom: renderer.domElement,
+        bots,
+        city,
+        onSelect: (sel) => dashboard.setSelection(sel),
+        onMove: (id, x, z) => actions.moveBot(id, x, z)
+      });
+      camRig.onModeChange((m) => dashboard.setCameraMode(m));
+
+      window.addEventListener('keydown', (e) => {
+        const tag = e.target && e.target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') return;
+        if (e.code === 'Space') {
+          e.preventDefault();
+          dashboard.setPaused(actions.togglePause());
+        } else if (e.key === 'Escape') {
+          selection.select(null);
+        }
+      });
+
+      // ---------- Agent <-> android wiring ----------
+      engine.on('taskAssigned', ({ agent, task }) => {
+        const bot = bots.get(agent.id);
+        const b = BUILDINGS.find((x) => x.id === task.building);
+        const s = workSpot(b);
+        bot.returnTimer = null;
+        bot.walker.working = false;
+        bot.walker.goTo(s.x, s.z, () => {
+          bot.walker.lookAt(b.x, b.z);
+          engine.startWork(agent.id);
+        });
+      });
+      engine.on('taskStarted', ({ agent }) => {
+        bots.get(agent.id).walker.working = true;
+      });
+      engine.on('taskCompleted', ({ agent }) => {
+        const bot = bots.get(agent.id);
+        bot.walker.working = false;
+        bot.returnTimer = 1.6;
+      });
+      engine.on('taskCancelled', ({ agent }) => {
+        if (!agent) return;
+        const bot = bots.get(agent.id);
+        bot.walker.working = false;
+        const s = hqSpot();
+        bot.walker.goTo(s.x, s.z);
+      });
+
+      function spawn(agent) {
+        const rig = createAndroid(CONFIG.departments[agent.dept].color);
+        rig.group.userData.agentId = agent.id;
+        const x = hq.door.x + (Math.random() - 0.5) * 2;
+        const z = hq.door.z + (Math.random() - 0.5) * 1.2;
+        scene.add(rig.group);
+        const walker = new Walker(rig, nav, x, z);
+        bots.set(agent.id, { agent, walker, rig, returnTimer: null });
+        agent.spawned = true;
+        engine.log(agent.name + ' deployed from HQ', CONFIG.departments[agent.dept].color);
+        const s = hqSpot();
+        walker.goTo(s.x, s.z);
+      }
+
+      // ---------- Loop ----------
+      let spawnIndex = 0;
+      let spawnClock = 0;
+      let realTime = 0;
+      let simTime = 0;
+      let last = performance.now();
+
+      function frame(now) {
+        const dt = Math.min(0.05, (now - last) / 1000);
+        last = now;
+        realTime += dt;
+        const sdt = paused ? 0 : Math.min(0.2, dt * speed); // simulation time (pause and speed apply here)
+        simTime += sdt;
+
+        spawnClock -= sdt;
+        if (spawnIndex < engine.agents.length && spawnClock <= 0) {
+          spawn(engine.agents[spawnIndex++]);
+          spawnClock = 0.7;
+        }
+
+        engine.update(sdt);
+
+        const walkers = [];
+        for (const bot of bots.values()) {
+          if (bot.returnTimer !== null) {
+            bot.returnTimer -= sdt;
+            if (bot.returnTimer <= 0) {
+              bot.returnTimer = null;
+              if (!bot.agent.task) {
+                const s = hqSpot();
+                bot.walker.goTo(s.x, s.z);
+              }
+            }
+          }
+          bot.walker.update(sdt, simTime);
+          walkers.push(bot.walker);
+        }
+        applySeparation(walkers, nav, sdt);
+
+        visuals.update(sdt, simTime);
+        city.update(dt, realTime);
+        camRig.update(dt);
+        selection.update(realTime);
+        dashboard.update(dt);
+
+        renderer.render(scene, camera);
+        if (boot) boot.classList.add('hide');
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    } catch (err) {
+      console.error(err);
+      boot.textContent = 'AI City OS could not start. Check your internet connection (Three.js loads from a CDN) and reload.';
+    }
+  </script>
+</body>
+</html>

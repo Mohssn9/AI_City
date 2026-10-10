@@ -1,0 +1,13 @@
+{
+  "name": "ai-city-os",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-based 3D AI City simulation with android agents",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
