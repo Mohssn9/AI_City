@@ -1,3 +1,4 @@
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -192,16 +193,23 @@ async function handleApi(req, res, urlPath) {
     try {
       let r;
       if (PROVIDER === 'gemini') {
-        r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(MODEL) + ':generateContent', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', 'x-goog-api-key': API_KEY },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: system }] },
-            contents: [{ role: 'user', parts: [{ text: task }] }],
-            generationConfig: { maxOutputTokens: 2000 }
-          }),
-          signal: AbortSignal.timeout(60000)
-        });
+        // Gemini can be briefly overloaded: retry, then fall back to a second model.
+        const FALLBACK = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash';
+        const models = [MODEL, MODEL, FALLBACK];
+        for (let i = 0; i < models.length; i++) {
+          r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(models[i]) + ':generateContent', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-goog-api-key': API_KEY },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: system }] },
+              contents: [{ role: 'user', parts: [{ text: task }] }],
+              generationConfig: { maxOutputTokens: 2000 }
+            }),
+            signal: AbortSignal.timeout(25000)
+          });
+          if (![429, 500, 503, 504].includes(r.status) || i === models.length - 1) break;
+          await new Promise((ok) => setTimeout(ok, 3000));
+        }
       } else {
         r = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
